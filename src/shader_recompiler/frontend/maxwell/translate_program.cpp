@@ -7,11 +7,16 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 #include <queue>
 
+#include <fmt/format.h>
+
+#include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
@@ -354,6 +359,49 @@ void TightenOutputVertices(IR::Program& program) {
         program.output_vertices = (std::min)(program.output_vertices, num_emits);
     }
 }
+
+// Time of each translation step for one program, logged when the whole takes over 100 ms: finds
+// the step that freezes the GPU thread on a new shader (NX2_NOTES row 121 was two quadratic
+// passes).
+class StepTimer {
+public:
+    template <typename Func>
+    void Run(const char* name, Func&& func) {
+        const auto begin = std::chrono::steady_clock::now();
+        func();
+        const auto elapsed = std::chrono::steady_clock::now() - begin;
+        total += elapsed;
+        if (count < steps.size()) {
+            steps[count++] = {name, elapsed};
+        }
+    }
+
+    void Report(const Environment& env, const IR::Program& program) const {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        if (total < std::chrono::milliseconds{100}) {
+            return;
+        }
+        size_t insts{};
+        for (const IR::Block* const block : program.blocks) {
+            insts += block->size();
+        }
+        std::string text;
+        for (size_t i = 0; i < count; ++i) {
+            if (steps[i].second >= std::chrono::milliseconds{1}) {
+                text += fmt::format(" {} {:.1f}", steps[i].first, ms(steps[i].second));
+            }
+        }
+        LOG_INFO(Shader,
+                 "Slow translation: stage {} at {:#x}, {} blocks, {} IR instructions, {:.1f} ms:{}",
+                 static_cast<u32>(program.stage), env.StartAddress(), program.blocks.size(), insts,
+                 ms(total), text);
+    }
+
+private:
+    std::array<std::pair<const char*, std::chrono::steady_clock::duration>, 32> steps{};
+    size_t count{};
+    std::chrono::steady_clock::duration total{};
+};
 } // Anonymous namespace
 
 IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
@@ -361,10 +409,15 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     HostTranslateInfo normalized_host_info{host_info};
     normalized_host_info.ApplyDescriptorLimitPolicy();
 
+    StepTimer timer;
     IR::Program program;
-    program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
-    program.blocks = GenerateBlocks(program.syntax_list);
-    program.post_order_blocks = PostOrder(program.syntax_list.front());
+    timer.Run("ASL", [&] {
+        program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
+    });
+    timer.Run("blocks", [&] {
+        program.blocks = GenerateBlocks(program.syntax_list);
+        program.post_order_blocks = PostOrder(program.syntax_list.front());
+    });
     program.stage = env.ShaderStage();
     program.local_memory_size = env.LocalMemorySize();
     switch (program.stage) {
@@ -423,41 +476,44 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     default:
         break;
     }
-    RemoveUnreachableBlocks(program);
+    timer.Run("unreachable", [&] { RemoveUnreachableBlocks(program); });
 
     // Replace instructions before the SSA rewrite
     if (!normalized_host_info.support_float64) {
-        Optimization::LowerFp64ToFp32(program);
+        timer.Run("fp64", [&] { Optimization::LowerFp64ToFp32(program); });
     }
     if (!normalized_host_info.support_float16) {
-        Optimization::LowerFp16ToFp32(program);
+        timer.Run("fp16", [&] { Optimization::LowerFp16ToFp32(program); });
     }
     if (!normalized_host_info.support_int64) {
-        Optimization::LowerInt64ToInt32(program);
+        timer.Run("int64", [&] { Optimization::LowerInt64ToInt32(program); });
     }
     if (!normalized_host_info.support_conditional_barrier) {
-        Optimization::ConditionalBarrierPass(program);
+        timer.Run("cond-barrier", [&] { Optimization::ConditionalBarrierPass(program); });
     }
-    Optimization::SsaRewritePass(program);
+    timer.Run("SSA", [&] { Optimization::SsaRewritePass(program); });
 
-    Optimization::ConstantPropagationPass(env, program);
+    timer.Run("const-prop", [&] { Optimization::ConstantPropagationPass(env, program); });
 
-    Optimization::PositionPass(env, program);
-    Optimization::BlitConstantsPass(env, program);
+    timer.Run("position", [&] { Optimization::PositionPass(env, program); });
+    timer.Run("blit-consts", [&] { Optimization::BlitConstantsPass(env, program); });
 
-    Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
-    Optimization::GeometryCompactionPass(program, normalized_host_info);
-    Optimization::TexturePass(env, program, normalized_host_info);
+    timer.Run("global-to-ssbo", [&] {
+        Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
+    });
+    timer.Run("geometry-compact",
+              [&] { Optimization::GeometryCompactionPass(program, normalized_host_info); });
+    timer.Run("texture", [&] { Optimization::TexturePass(env, program, normalized_host_info); });
 
     if (Settings::values.resolution_info.active) {
-        Optimization::RescalingPass(program);
+        timer.Run("rescaling", [&] { Optimization::RescalingPass(program); });
     }
-    Optimization::DeadCodeEliminationPass(program);
+    timer.Run("DCE", [&] { Optimization::DeadCodeEliminationPass(program); });
     TightenOutputVertices(program);
     if (Settings::values.renderer_debug) {
-        Optimization::VerificationPass(program);
+        timer.Run("verify", [&] { Optimization::VerificationPass(program); });
     }
-    Optimization::CollectShaderInfoPass(env, program);
+    timer.Run("collect-info", [&] { Optimization::CollectShaderInfoPass(env, program); });
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {
@@ -470,12 +526,14 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
             program.info.stores.Set(static_cast<IR::Attribute>(line), true);
         }
     }
-    Optimization::LayerPass(program, normalized_host_info);
-    Optimization::VendorWorkaroundPass(program);
+    timer.Run("layer", [&] { Optimization::LayerPass(program, normalized_host_info); });
+    timer.Run("vendor", [&] { Optimization::VendorWorkaroundPass(program); });
 
-    CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program);
-    Optimization::LimitSampledTextureArrays(program, normalized_host_info);
+    timer.Run("interpolation", [&] { CollectInterpolationInfo(env, program); });
+    timer.Run("nvn-ssbo", [&] { AddNVNStorageBuffers(program); });
+    timer.Run("tex-arrays",
+              [&] { Optimization::LimitSampledTextureArrays(program, normalized_host_info); });
+    timer.Report(env, program);
     return program;
 }
 

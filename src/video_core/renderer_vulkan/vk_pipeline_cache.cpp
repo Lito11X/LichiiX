@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -394,6 +395,18 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
+    // EDEN_NX2_PIPELINE_WORKERS=<n>: pipeline build threads, to A/B fewer than the default (all
+    // host threads but one). Native driver builds take seconds each; on a 6-core host, 11 of
+    // them compete with the emulated CPU and GPU threads.
+    if (const char* value = std::getenv("EDEN_NX2_PIPELINE_WORKERS")) {
+        const int requested = std::atoi(value);
+        if (requested > 0) {
+            const size_t workers = std::min(max_core_threads, static_cast<size_t>(requested));
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_PIPELINE_WORKERS: {} pipeline workers (default {})",
+                     workers, max_core_threads);
+            return workers;
+        }
+    }
     return max_core_threads;
 #endif
 }
@@ -1172,6 +1185,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::unique_ptr<EmissionBudget::Reservation> reservation) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+    const auto build_begin = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration cfg_time{}, translate_time{};
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
@@ -1215,7 +1230,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+        const auto cfg_begin = std::chrono::steady_clock::now();
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        const auto translate_begin = std::chrono::steady_clock::now();
+        cfg_time += translate_begin - cfg_begin;
         if (!uses_vertex_a || index != 1) {
             // Normal path
             programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
@@ -1225,6 +1243,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
         }
+        translate_time += std::chrono::steady_clock::now() - translate_begin;
 
         if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
             LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
@@ -1351,10 +1370,29 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         };
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
-    return std::make_unique<GraphicsPipeline>(
+    const auto objects_begin = std::chrono::steady_clock::now();
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
+    if (build_in_parallel) {
+        // Where a slow runtime build spent its GPU thread time: control flow, translation (see
+        // "Slow translation" for its steps), the rest of this function (SPIR-V when not deferred)
+        // and the pipeline object (descriptor and pipeline layouts, queueing the driver build).
+        const auto end = std::chrono::steady_clock::now();
+        if (end - build_begin > std::chrono::milliseconds{100}) {
+            const auto ms = [](auto d) {
+                return std::chrono::duration<double, std::milli>(d).count();
+            };
+            LOG_INFO(Render_Vulkan,
+                     "Slow graphics pipeline {:016x}: {:.1f} ms = cfg {:.1f}, translate {:.1f}, "
+                     "emit/other {:.1f}, objects {:.1f}; {} pipeline workers, {} emissions pending",
+                     hash, ms(end - build_begin), ms(cfg_time), ms(translate_time),
+                     ms(objects_begin - build_begin - cfg_time - translate_time),
+                     ms(end - objects_begin), num_pipeline_workers, emission_budget.Pending());
+        }
+    }
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
